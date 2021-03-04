@@ -3,10 +3,11 @@ import fractions
 import logging
 import threading
 import time
-from typing import Optional, Set
+from typing import Dict, Optional, Set
 
 import av
 from av import AudioFrame, VideoFrame
+from av.frame import Frame
 
 from ..mediastreams import AUDIO_PTIME, MediaStreamError, MediaStreamTrack
 
@@ -77,6 +78,92 @@ class MediaBlackhole:
             if task is not None:
                 task.cancel()
         self.__tracks = {}
+
+
+class BroadcasterStreamTrack(MediaStreamTrack):
+    def __init__(self, broadcaster, source: MediaStreamTrack) -> None:
+        super().__init__()
+        self.kind = source.kind
+        self._broadcaster = broadcaster
+        self._queue: asyncio.Queue[Optional[Frame]] = asyncio.Queue()
+        self._source: Optional[MediaStreamTrack] = source
+
+    async def recv(self):
+        if self.readyState != "live":
+            raise MediaStreamError
+
+        self._broadcaster._start(self)
+        frame = await self._queue.get()
+        if frame is None:
+            self.stop()
+            raise MediaStreamError
+        return frame
+
+    def stop(self):
+        super().stop()
+        if self._broadcaster is not None:
+            self._broadcaster._stop(self)
+            self._broadcaster = None
+            self._source = None
+
+
+class MediaBroadcaster:
+    """
+    A media source that relays one or more tracks.
+    """
+
+    def __init__(self) -> None:
+        self.__proxies: Dict[MediaStreamTrack, Set[BroadcasterStreamTrack]] = {}
+        self.__tasks: Dict[MediaStreamTrack, asyncio.Future[None]] = {}
+
+    def subscribe(self, track: MediaStreamTrack) -> MediaStreamTrack:
+        """
+        Create a proxy around the given `track` for a new consumer.
+        """
+        proxy = BroadcasterStreamTrack(self, track)
+        self.__log_debug("Create proxy %s for source %s", id(proxy), id(track))
+        if track not in self.__proxies:
+            self.__proxies[track] = set()
+        return proxy
+
+    def _start(self, proxy: BroadcasterStreamTrack) -> None:
+        track = proxy._source
+        if track is not None and track in self.__proxies:
+            # register proxy
+            if proxy not in self.__proxies[track]:
+                self.__log_debug("Start proxy %s", id(proxy))
+                self.__proxies[track].add(proxy)
+
+            # start worker
+            if track not in self.__tasks:
+                self.__tasks[track] = asyncio.ensure_future(self.__run_track(track))
+
+    def _stop(self, proxy: BroadcasterStreamTrack) -> None:
+        track = proxy._source
+        if track is not None and track in self.__proxies:
+            # unregister proxy
+            self.__log_debug("Stop proxy %s", id(proxy))
+            self.__proxies[track].discard(proxy)
+
+    def __log_debug(self, msg: str, *args) -> None:
+        logger.debug(f"MediaBroadcaster(%s) {msg}", id(self), *args)
+
+    async def __run_track(self, track: MediaStreamTrack) -> None:
+        self.__log_debug("Start reading source %s" % id(track))
+
+        while True:
+            try:
+                frame = await track.recv()
+            except MediaStreamError:
+                frame = None
+            for proxy in self.__proxies[track]:
+                proxy._queue.put_nowait(frame)
+            if frame is None:
+                break
+
+        self.__log_debug("Stop reading source %s", id(track))
+        del self.__proxies[track]
+        del self.__tasks[track]
 
 
 def player_worker(
