@@ -81,19 +81,36 @@ class MediaBlackhole:
 
 
 class BroadcasterStreamTrack(MediaStreamTrack):
-    def __init__(self, broadcaster, source: MediaStreamTrack) -> None:
+    def __init__(self, broadcaster, source: MediaStreamTrack, buffered=True) -> None:
         super().__init__()
         self.kind = source.kind
+        self.buffered = buffered
         self._broadcaster = broadcaster
-        self._queue: asyncio.Queue[Optional[Frame]] = asyncio.Queue()
         self._source: Optional[MediaStreamTrack] = source
+
+        self._queue: Optional[asyncio.Queue[Optional[Frame]]] = None
+
+        self._frame: Optional[Frame] = None
+        self._new_frame_event: Optional[asyncio.Event] = None
+
+        if self.buffered:
+            self._queue = asyncio.Queue()
+        else:
+            self._new_frame_event = asyncio.Event()
 
     async def recv(self):
         if self.readyState != "live":
             raise MediaStreamError
 
         self._broadcaster._start(self)
-        frame = await self._queue.get()
+
+        if self.buffered:
+            frame = await self._queue.get()
+        else:
+            await self._new_frame_event.wait()
+            frame = self._frame
+            self._new_frame_event.clear()
+
         if frame is None:
             self.stop()
             raise MediaStreamError
@@ -116,11 +133,11 @@ class MediaBroadcaster:
         self.__proxies: Dict[MediaStreamTrack, Set[BroadcasterStreamTrack]] = {}
         self.__tasks: Dict[MediaStreamTrack, asyncio.Future[None]] = {}
 
-    def subscribe(self, track: MediaStreamTrack) -> MediaStreamTrack:
+    def subscribe(self, track: MediaStreamTrack, buffered=True) -> MediaStreamTrack:
         """
         Create a proxy around the given `track` for a new consumer.
         """
-        proxy = BroadcasterStreamTrack(self, track)
+        proxy = BroadcasterStreamTrack(self, track, buffered=buffered)
         self.__log_debug("Create proxy %s for source %s", id(proxy), id(track))
         if track not in self.__proxies:
             self.__proxies[track] = set()
@@ -157,7 +174,11 @@ class MediaBroadcaster:
             except MediaStreamError:
                 frame = None
             for proxy in self.__proxies[track]:
-                proxy._queue.put_nowait(frame)
+                if proxy.buffered:
+                    asyncio.ensure_future(proxy._queue.put(frame))
+                else:
+                    proxy._frame = frame
+                    proxy._new_frame_event.set()
             if frame is None:
                 break
 
